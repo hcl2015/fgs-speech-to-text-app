@@ -2,8 +2,8 @@ const https = require('https');
 
 module.exports = async function (context, req) {
   const apiKey = process.env.QWEN_API_KEY;
-  const apiUrl =
-    process.env.QWEN_API_URL ||
+  // Use the correct OpenAI-compatible endpoint
+  const apiUrl = process.env.QWEN_API_URL || 
     'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
   const model = process.env.QWEN_MODEL || 'qwen-max';
 
@@ -12,16 +12,16 @@ module.exports = async function (context, req) {
     context.res = {
       status: 500,
       headers: { 'Content-Type': 'application/json' },
-
-      body: { error: 'Text rewriting service is not configured on the server.' ,
-              details: 'QWEN_API_KEY environment variable is missing'
-            }
+      body: { 
+        error: 'Text rewriting service is not configured on the server.',
+        details: 'QWEN_API_KEY environment variable is missing'
+      }
     };
     return;
   }
 
-  const text = (req.body && req.body.text) || '';
-  const relevantPhrases = (req.body && req.body.relevantPhrases) || '';
+  const text = req.body?.text || '';
+  const relevantPhrases = req.body?.relevantPhrases || '';
   
   context.log(`Processing text: ${text.substring(0, 50)}...`);
 
@@ -50,98 +50,167 @@ module.exports = async function (context, req) {
     响应: 般若波羅蜜多心經詮釋空性深義`;
 
   const payload = JSON.stringify({
-    model,
+    model: model,
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: text }
     ],
     temperature: 0.1,
-    max_tokens: 1000
+    max_tokens: 1000,
+    stream: false  // Explicitly disable streaming for OpenAI compatibility
   });
 
   const url = new URL(apiUrl);
 
   const options = {
     hostname: url.hostname,
-    path: url.pathname + url.search,
+    path: url.pathname + (url.search || ''),
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
+      'Authorization': `Bearer ${apiKey}`,
       'Content-Length': Buffer.byteLength(payload),
+      // Add these headers for better compatibility
+      'Accept': 'application/json',
+      'User-Agent': 'Azure-Functions-Qwen-Client/1.0'
     },
-    timeout:30000
+    timeout: 30000
   };
 
   try {
     const result = await new Promise((resolve, reject) => {
-      const req = https.request(options, res => {
+      const request = https.request(options, (response) => {
         let data = '';
-        res.on('data', chunk => (data += chunk));
-        res.on('end', () => {
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            resolve({ status: res.statusCode, data });
+        
+        // Handle response headers
+        context.log(`Response status: ${response.statusCode}`);
+        context.log(`Response headers: ${JSON.stringify(response.headers)}`);
+        
+        response.on('data', (chunk) => {
+          data += chunk;
+        });
+        
+        response.on('end', () => {
+          context.log(`Response body received (${data.length} bytes)`);
+          
+          if (response.statusCode >= 200 && response.statusCode < 300) {
+            resolve({
+              status: response.statusCode,
+              headers: response.headers,
+              data: data
+            });
           } else {
-            reject(
-              new Error(`Qwen API failed with status ${res.statusCode}: ${data}`)
-            );
+            const error = new Error(`Qwen API failed with status ${response.statusCode}`);
+            error.statusCode = response.statusCode;
+            error.responseData = data;
+            reject(error);
           }
         });
       });
 
-      req.on('error', (error) => {
+      request.on('error', (error) => {
+        context.log.error('Request error:', error);
         reject(new Error(`Request failed: ${error.message}`));
       });
       
-      req.on('timeout', () => {
-        req.destroy();
-        reject(new Error('Request timeout'));
+      request.on('timeout', () => {
+        request.destroy();
+        reject(new Error('Request timeout after 30 seconds'));
       });
 
-      req.write(payload);
-      req.end();
+      // Log the request for debugging
+      context.log(`Sending request to: ${url.hostname}${options.path}`);
+      context.log(`Payload length: ${Buffer.byteLength(payload)} bytes`);
+      
+      request.write(payload);
+      request.end();
     });
 
     let parsed;
     try {
-      parsed = JSON.parse(result);
+      parsed = JSON.parse(result.data);
+      context.log('Successfully parsed Qwen response');
     } catch (e) {
-      context.log.error('Failed to parse Qwen response as JSON:', e);
+      context.log.error('Failed to parse Qwen response as JSON:', e.message);
+      context.log.error('Response data:', result.data.substring(0, 500));
       context.res = {
         status: 500,
+        headers: { 'Content-Type': 'application/json' },
         body: { 
           error: 'Text rewriting service returned invalid data.',
-          details: 'Failed to parse JSON response from Qwen API'
-              }
+          details: 'Failed to parse JSON response from Qwen API',
+          rawResponse: result.data.substring(0, 200)
+        }
       };
       return;
     }
 
+    // Debug: Log the parsed response structure
+    context.log('Parsed response keys:', Object.keys(parsed));
+    if (parsed.choices) {
+      context.log(`Number of choices: ${parsed.choices.length}`);
+    }
+
     let rewrittenText = text;
-    if (
-      parsed.choices &&
-      parsed.choices.length > 0 &&
-      parsed.choices[0].message &&
-      parsed.choices[0].message.content
-    ) {
-      rewrittenText = parsed.choices[0].message.content;
+    if (parsed.choices && 
+        Array.isArray(parsed.choices) && 
+        parsed.choices.length > 0 &&
+        parsed.choices[0].message &&
+        parsed.choices[0].message.content) {
+      
+      rewrittenText = parsed.choices[0].message.content.trim();
+      context.log(`Successfully extracted rewritten text (${rewrittenText.length} chars)`);
+      
+    } else if (parsed.choices && 
+               Array.isArray(parsed.choices) && 
+               parsed.choices.length > 0 &&
+               parsed.choices[0].text) {
+      
+      // Alternative format for some OpenAI-compatible APIs
+      rewrittenText = parsed.choices[0].text.trim();
+      context.log(`Extracted text from alternative format (${rewrittenText.length} chars)`);
+      
+    } else {
+      context.log.warn('Unexpected response format:', JSON.stringify(parsed, null, 2).substring(0, 500));
+      context.log.warn('Using original text as fallback');
     }
 
     context.res = {
       status: 200,
-      headers: { 'Content-Type': 'application/json' },
-      body: { rewrittenText }
+      headers: { 
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-cache'
+      },
+      body: { 
+        rewrittenText,
+        originalLength: text.length,
+        rewrittenLength: rewrittenText.length
+      }
     };
+    
   } catch (err) {
-    context.log.error('Error calling Qwen API:', err);
+    context.log.error('Error calling Qwen API:', err.message);
+    context.log.error('Error stack:', err.stack);
+    
+    // Provide more detailed error information
+    let errorDetails = err.message;
+    if (err.responseData) {
+      try {
+        const errorResp = JSON.parse(err.responseData);
+        errorDetails += ` | API Error: ${JSON.stringify(errorResp)}`;
+      } catch (e) {
+        errorDetails += ` | Raw Error: ${err.responseData.substring(0, 200)}`;
+      }
+    }
+    
     context.res = {
       status: 500,
+      headers: { 'Content-Type': 'application/json' },
       body: { 
-        error: 'Failed to rewrite text on the server.' ,
-        details: error.message
-}
+        error: 'Failed to rewrite text on the server.',
+        details: errorDetails,
+        suggestion: 'Check Qwen API key and endpoint configuration'
+      }
     };
   }
 };
-
-
