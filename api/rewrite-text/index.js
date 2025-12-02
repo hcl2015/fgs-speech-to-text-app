@@ -11,17 +11,24 @@ module.exports = async function (context, req) {
     context.log.error('Missing Qwen API key in environment.');
     context.res = {
       status: 500,
-      body: { error: 'Text rewriting service is not configured on the server.' }
+      headers: { 'Content-Type': 'application/json' },
+
+      body: { error: 'Text rewriting service is not configured on the server.' ,
+              details: 'QWEN_API_KEY environment variable is missing'
+            }
     };
     return;
   }
 
   const text = (req.body && req.body.text) || '';
   const relevantPhrases = (req.body && req.body.relevantPhrases) || '';
+  
+  context.log(`Processing text: ${text.substring(0, 50)}...`);
 
   if (!text.trim()) {
     context.res = {
       status: 200,
+      headers: { 'Content-Type': 'application/json' },
       body: { rewrittenText: text }
     };
     return;
@@ -56,14 +63,14 @@ module.exports = async function (context, req) {
 
   const options = {
     hostname: url.hostname,
-    path: url.pathname,
+    path: url.pathname + url.search,
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`,
       'Content-Length': Buffer.byteLength(payload),
-      'X-DashScope-SSE': 'disable'
-    }
+    },
+    timeout:30000
   };
 
   try {
@@ -73,7 +80,7 @@ module.exports = async function (context, req) {
         res.on('data', chunk => (data += chunk));
         res.on('end', () => {
           if (res.statusCode >= 200 && res.statusCode < 300) {
-            resolve(data);
+            resolve({ status: res.statusCode, data });
           } else {
             reject(
               new Error(`Qwen API failed with status ${res.statusCode}: ${data}`)
@@ -82,7 +89,15 @@ module.exports = async function (context, req) {
         });
       });
 
-      req.on('error', reject);
+      req.on('error', (error) => {
+        reject(new Error(`Request failed: ${error.message}`));
+      });
+      
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new Error('Request timeout'));
+      });
+
       req.write(payload);
       req.end();
     });
@@ -94,7 +109,10 @@ module.exports = async function (context, req) {
       context.log.error('Failed to parse Qwen response as JSON:', e);
       context.res = {
         status: 500,
-        body: { error: 'Text rewriting service returned invalid data.' }
+        body: { 
+          error: 'Text rewriting service returned invalid data.',
+          details: 'Failed to parse JSON response from Qwen API'
+              }
       };
       return;
     }
@@ -118,7 +136,10 @@ module.exports = async function (context, req) {
     context.log.error('Error calling Qwen API:', err);
     context.res = {
       status: 500,
-      body: { error: 'Failed to rewrite text on the server.' }
+      body: { 
+        error: 'Failed to rewrite text on the server.' ,
+        details: error.message
+}
     };
   }
 };
